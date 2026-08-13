@@ -60,6 +60,15 @@ wait_for_jobs () {
   while test $(jobs -p | wc -w) -ge "$((2*$(nproc)))"; do wait -n; done
 }
 
+uuidgen () {
+  python -c "import uuid; print(uuid.uuid4())"
+}
+
+jq () {
+  command jq "$@" | tr -d '\r'
+  return ${PIPESTATUS[0]}
+}
+
 # ensure input pack exists
 if ! test -f "${1}"; then
    status_message error "Input resource pack ${1} is not in this directory"
@@ -119,9 +128,9 @@ read -p $'\e[37mTo acknowledge and continue, press enter. To exit, press Ctrl+C.
 fi
 
 # ensure we have all the required dependencies
-dependency_check "jq" "https://stedolan.github.io/jq/download/" "jq --version" "1.6\|1.7"
+dependency_check "jq" "https://stedolan.github.io/jq/download/" "jq --version" "1\.[6-9]"
 dependency_check "sponge" "https://joeyh.name/code/moreutils/" "-v sponge" ""
-dependency_check "imagemagick" "https://imagemagick.org/script/download.php" "convert --version" ""
+dependency_check "imagemagick" "https://imagemagick.org/script/download.php" "magick -version" ""
 dependency_check "spritesheet-js" "https://www.npmjs.com/package/spritesheet-js" "-v spritesheet-js" ""
 status_message completion "All dependencies have been satisfied\n"
 
@@ -141,9 +150,17 @@ ${C_GRAY}Block material: ${C_BLUE}${block_material:=alpha_test}
 ${C_GRAY}Fallback pack URL: ${C_BLUE}${fallback_pack:=null}
 "
 
+input_pack_abs="$(cd "$(dirname "${1}")" && pwd)/$(basename "${1}")"
+if [[ ${merge_input} != "null" ]] && test -f "${merge_input}"; then
+  merge_input="$(cd "$(dirname "${merge_input}")" && pwd)/$(basename "${merge_input}")"
+fi
+mkdir -p staging
+cd staging
+cp "${input_pack_abs}" input_pack.zip
+
 # decompress our input pack
 status_message process "Decompressing input pack"
-unzip -n -q "${1}"
+unzip -n -q input_pack.zip
 status_message completion "Input pack decompressed"
 
 # exit the script if no input pack exists by checking for a pack.mcmeta file
@@ -360,14 +377,15 @@ json_dir=($(find ./assets/**/models -type f -name '*.json'))
 
 # ensure all our reference files in config.json exist, and delete the entry if they do not
 status_message critical "Removing config entries that do not have an associated JSON file in the pack"
-jq '
+printf '%s\n' "${json_dir[@]}" | jq -R . > scratch_files/json_dir.json
+jq --slurpfile files scratch_files/json_dir.json '
 
 def real_file($input):
-($ARGS.positional | index($input) // null);
+($files | index($input) // null);
 
 map_values(if real_file(.path) != null then . else empty end)
 
-' config.json --args ${json_dir[@]} | sponge config.json
+' config.json | sponge config.json
 
 # get a bash array of all our input models
 status_message process "Creating a bash array for remaing models in our predicate config"
@@ -375,7 +393,7 @@ model_array=($(jq -r '[.[].path] | unique | .[]' config.json))
 
 # find initial parental information
 status_message process "Doing an initial sweep for level 1 parentals"
-jq -n '
+printf '%s\0' "${model_array[@]}" | xargs -0 -n 500 jq -n '
 
 [def namespace: if contains(":") then sub("\\:(.+)"; "") else "minecraft" end;
 
@@ -385,7 +403,7 @@ inputs | {
   }
 ]
 
-' ${model_array[@]} | sponge scratch_files/parents.json
+' | jq -s 'add' | sponge scratch_files/parents.json
 
 # add initial parental information to config.json
 status_message critical "Removing config entries with non-supported parentals\n"
@@ -598,12 +616,12 @@ then
 fi
 
 # generate a fallback texture
-convert -size 16x16 xc:\#FFFFFF ./assets/minecraft/textures/0.png
+magick -size 16x16 xc:\#FFFFFF ./assets/minecraft/textures/0.png
 
 # make sure we crop all mcmeta associated png files
 status_message process "Cropping animated textures"
 for i in $(find ./assets/**/textures -type f -name "*.mcmeta" | sed 's/\.mcmeta//'); do 
-convert ${i} -set option:distort:viewport "%[fx:min(w,h)]x%[fx:min(w,h)]" -distort affine "0,0 0,0" -define png:format=png8 -clamp ${i} 2> /dev/null
+magick ${i} -set option:distort:viewport "%[fx:min(w,h)]x%[fx:min(w,h)]" -distort affine "0,0 0,0" -define png:format=png8 -clamp ${i} 2> /dev/null
 done
 
 status_message completion "Initial pack setup complete\n"
@@ -642,22 +660,22 @@ do
     status_message process "Locating parental info for child model with GeyserID ${gid}"
 
     # itterate through parented models until they all have geometry, display, and textures
-    until [[ ${elements} != null && ${textures} != null && ${display} != null ]] || [[ ${parental} = "./assets/minecraft/models/builtin/generated.json" ]] || [[ ${parental} = null ]]
+    until [[ ${elements} != null && ${textures} != null && ${display} != null ]] || [[ ! -f ${parental} ]] || [[ ${parental} = null ]]
     do
       if [[ ${elements} = null ]]
       then
-        local elements="$(jq -rc '.elements' ${parental} 2> /dev/null | tee scratch_files/${gid}.elements.temp || (echo && echo null))"
+        local elements="$(jq -rc '.elements' ${parental} 2> /dev/null | tee scratch_files/${gid}.elements.temp || echo null)"
         local element_parent=${parental}
       fi
       if [[ ${textures} = null ]]
       then
-        local textures="$(jq -rc '.textures' ${parental} 2> /dev/null | tee scratch_files/${gid}.textures.temp || (echo && echo null))"
+        local textures="$(jq -rc '.textures' ${parental} 2> /dev/null | tee scratch_files/${gid}.textures.temp || echo null)"
       fi
       if [[ ${display} = null ]]
       then
-        local display="$(jq -rc '.display' ${parental} 2> /dev/null | tee scratch_files/${gid}.display.temp || (echo && echo null))"
+        local display="$(jq -rc '.display' ${parental} 2> /dev/null | tee scratch_files/${gid}.display.temp || echo null)"
       fi
-      local parental="$(jq -rc 'def namespace: if contains(":") then sub("\\:(.+)"; "") else "minecraft" end; ("./assets/" + (.parent? | namespace) + "/models/" + ((.parent? // empty) | sub("(.*?)\\:"; "")) + ".json") // "null"' ${parental} 2> /dev/null || (echo && echo null))"
+      local parental="$(jq -rc 'def namespace: if contains(":") then sub("\\:(.+)"; "") else "minecraft" end; ("./assets/" + (.parent? | namespace) + "/models/" + ((.parent? // empty) | sub("(.*?)\\:"; "")) + ".json") // "null"' ${parental} 2> /dev/null || echo null)"
       local texture_0="$(jq -rc 'def namespace: if contains(":") then sub("\\:(.+)"; "") else "minecraft" end; ("./assets/" + ([.[]][0]? | namespace) + "/textures/" + (([.[]][0]? // empty) | sub("(.*?)\\:"; "")) + ".png") // "null"' scratch_files/${gid}.textures.temp)"
     done
 
@@ -675,7 +693,7 @@ do
       status_message completion "Located all parental info for Child ${gid}\n$(ProgressBar ${tot_pos} ${_end})"
       echo
     # check if this is a 2d item dervived from ./assets/minecraft/models/builtin/generated
-    elif [[ ${textures} != null && ${parental} = "./assets/minecraft/models/builtin/generated.json" && -f "${texture_0}" ]]
+    elif [[ ${textures} != null && ( ${parental} = */generated.json || ${parental} = */handheld.json ) && -f "${texture_0}" ]]
     then
       jq -n --slurpfile jelements scratch_files/${gid}.elements.temp --slurpfile jtextures scratch_files/${gid}.textures.temp --slurpfile jdisplay scratch_files/${gid}.display.temp '
       {
@@ -747,15 +765,15 @@ model_list=( $(jq -r '.[] | select(.generated == false) | .path' config.json) )
 # get our final texture list to be atlased
 # get a bash array of all texture files in our resource pack
 status_message process "Generating an array of all model PNG files to crosscheck with our atlas"
-jq -n '$ARGS.positional' --args $(find ./assets/**/textures -type f -name '*.png') | sponge scratch_files/all_textures.temp
+find ./assets/**/textures -type f -name '*.png' | jq -R -s 'rtrimstr("\n") | split("\n")' > scratch_files/all_textures.temp
 # get bash array of all texture files listed in our models
 status_message process "Generating union atlas arrays for all model textures"
-jq -s '
-def namespace: 
-  if contains(":") then sub("\\:(.+)"; "") else "minecraft" end; 
-[.[]| [.textures[]?] | unique] 
+printf '%s\0' "${model_list[@]}" | xargs -0 cat | jq -s '
+def namespace:
+  if contains(":") then sub("\\:(.+)"; "") else "minecraft" end;
+[.[]| [.textures[]?] | unique]
 | map(map("./assets/" + (. | namespace) + "/textures/" + (. | sub("(.*?)\\:"; "")) + ".png"))
-' ${model_list[@]} | sponge scratch_files/union_atlas.temp
+' | sponge scratch_files/union_atlas.temp
 jq '
 def intersects(a;b): any(a[]; . as $x | any(b[]; . == $x));
 
